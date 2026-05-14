@@ -68,6 +68,10 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
+  HAL_Init();
+   __HAL_RCC_GPIOA_CLK_ENABLE();
+   __HAL_RCC_GPIOB_CLK_ENABLE();
+   __HAL_RCC_GPIOC_CLK_ENABLE();
 
   /* USER CODE END 1 */
 
