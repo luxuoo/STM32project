@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "i2c.h"
 #include "spi.h"
 #include "tim.h"
 #include "usart.h"
@@ -25,7 +26,11 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "bh1750.h"
+#include "aht20.h"
+#include "oled.h"
+#include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -46,7 +51,15 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+volatile uint8_t tim3_flag = 0;
+volatile uint8_t rs485_query = 0;
+uint8_t rx_byte;
+float light_lux = 0.0f;
+float temperature = 0.0f;
+float humidity = 0.0f;
+uint8_t led_state = 0;
+char oled_line[32];
+char rs485_buf[64];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -68,10 +81,6 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  HAL_Init();
-   __HAL_RCC_GPIOA_CLK_ENABLE();
-   __HAL_RCC_GPIOB_CLK_ENABLE();
-   __HAL_RCC_GPIOC_CLK_ENABLE();
 
   /* USER CODE END 1 */
 
@@ -93,11 +102,22 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_I2C1_Init();
   MX_SPI1_Init();
   MX_TIM3_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
+  OLED_Init();
+  BH1750_Init(&hi2c1);
+  AHT20_Init(&hi2c1);
+  HAL_TIM_Base_Start_IT(&htim3);
+  HAL_UART_Receive_IT(&huart3, &rx_byte, 1);
 
+  OLED_Clear();
+  OLED_WriteString(0, 0,  "Env Monitor System");
+  OLED_WriteString(0, 16, "Initializing...");
+  OLED_Display();
+  HAL_Delay(1000);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -107,9 +127,63 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-    HAL_Delay(500);
+    if (tim3_flag)
+    {
+      tim3_flag = 0;
 
+      /* I2C error recovery */
+      if (HAL_I2C_GetError(&hi2c1) != HAL_I2C_ERROR_NONE)
+      {
+        HAL_I2C_DeInit(&hi2c1);
+        MX_I2C1_Init();
+        BH1750_Init(&hi2c1);
+        AHT20_Init(&hi2c1);
+      }
+
+      /* Read BH1750 */
+      BH1750_ReadLight(&hi2c1, &light_lux);
+
+      /* Read AHT20 */
+      AHT20_Read(&hi2c1, &temperature, &humidity);
+
+      /* Threshold lighting */
+      if (light_lux <= 300.0f)
+      {
+        HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
+        led_state = 1;
+      }
+      else
+      {
+        HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+        led_state = 0;
+      }
+
+      /* OLED display */
+      OLED_Clear();
+
+      sprintf(oled_line, "Lux: %.0f lx", light_lux);
+      OLED_WriteString(0, 0, oled_line);
+
+      sprintf(oled_line, "Temp: %.1f C", temperature);
+      OLED_WriteString(0, 16, oled_line);
+
+      sprintf(oled_line, "Humi: %.1f %%RH", humidity);
+      OLED_WriteString(0, 32, oled_line);
+
+      sprintf(oled_line, "LED: %s", led_state ? "ON" : "OFF");
+      OLED_WriteString(0, 48, oled_line);
+
+      OLED_Display();
+    }
+
+    /* RS485 query response */
+    if (rs485_query)
+    {
+      rs485_query = 0;
+      sprintf(rs485_buf, "LED:%s Lux:%.0f T:%.1f H:%.1f\r\n",
+              led_state ? "ON" : "OFF", light_lux, temperature, humidity);
+      HAL_UART_Transmit(&huart3, (uint8_t *)rs485_buf, strlen(rs485_buf), 200);
+    }
   }
   /* USER CODE END 3 */
 }
@@ -154,7 +228,25 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM3)
+  {
+    tim3_flag = 1;
+  }
+}
 
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART3)
+  {
+    if (rx_byte == 'Q')
+    {
+      rs485_query = 1;
+    }
+    HAL_UART_Receive_IT(&huart3, &rx_byte, 1);
+  }
+}
 /* USER CODE END 4 */
 
 /**
