@@ -102,14 +102,39 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_I2C1_Init();
   MX_SPI1_Init();
   MX_TIM3_Init();
   MX_USART3_UART_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
+  /* Debug: LED blink to confirm program running */
+  for (int i = 0; i < 5; i++) {
+    HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+    HAL_Delay(200);
+    HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
+    HAL_Delay(200);
+  }
+
+  /* Debug: send startup message via UART */
+  char *startup_msg = "=== System Starting ===\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t *)startup_msg, strlen(startup_msg), 200);
+
   OLED_Init();
+  HAL_UART_Transmit(&huart3, (uint8_t *)"OLED Init OK\r\n", 14, 200);
+
   BH1750_Init(&hi2c1);
+  HAL_UART_Transmit(&huart3, (uint8_t *)"BH1750 Init OK\r\n", 16, 200);
+
   AHT20_Init(&hi2c1);
+  HAL_UART_Transmit(&huart3, (uint8_t *)"AHT20 Init OK\r\n", 15, 200);
+
+  /* Check I2C bus status */
+  if (HAL_I2C_GetError(&hi2c1) != HAL_I2C_ERROR_NONE) {
+    HAL_UART_Transmit(&huart3, (uint8_t *)"I2C Error!\r\n", 12, 200);
+  } else {
+    HAL_UART_Transmit(&huart3, (uint8_t *)"I2C OK\r\n", 8, 200);
+  }
+
   HAL_TIM_Base_Start_IT(&htim3);
   HAL_UART_Receive_IT(&huart3, &rx_byte, 1);
 
@@ -118,6 +143,9 @@ int main(void)
   OLED_WriteString(0, 16, "Initializing...");
   OLED_Display();
   HAL_Delay(1000);
+
+  startup_msg = "=== System Ready ===\r\n";
+  HAL_UART_Transmit(&huart3, (uint8_t *)startup_msg, strlen(startup_msg), 200);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -141,10 +169,16 @@ int main(void)
       }
 
       /* Read BH1750 */
-      BH1750_ReadLight(&hi2c1, &light_lux);
+      uint8_t bh1750_result = BH1750_ReadLight(&hi2c1, &light_lux);
+      if (bh1750_result != 0) {
+        HAL_UART_Transmit(&huart3, (uint8_t *)"BH1750 Read Failed!\r\n", 21, 200);
+      }
 
       /* Read AHT20 */
-      AHT20_Read(&hi2c1, &temperature, &humidity);
+      uint8_t aht20_result = AHT20_Read(&hi2c1, &temperature, &humidity);
+      if (aht20_result != 0) {
+        HAL_UART_Transmit(&huart3, (uint8_t *)"AHT20 Read Failed!\r\n", 20, 200);
+      }
 
       /* Threshold lighting */
       if (light_lux <= 300.0f)
@@ -158,30 +192,47 @@ int main(void)
         led_state = 0;
       }
 
+      /* Convert float to integer for display */
+      int lux_int = (int)light_lux;
+      int temp_int = (int)(temperature * 10);
+      int humi_int = (int)(humidity * 10);
+
       /* OLED display */
       OLED_Clear();
 
-      sprintf(oled_line, "Lux: %.0f lx", light_lux);
+      sprintf(oled_line, "Lux: %d lx", lux_int);
       OLED_WriteString(0, 0, oled_line);
 
-      sprintf(oled_line, "Temp: %.1f C", temperature);
+      sprintf(oled_line, "Temp: %d.%d C", temp_int / 10, temp_int % 10);
       OLED_WriteString(0, 16, oled_line);
 
-      sprintf(oled_line, "Humi: %.1f %%RH", humidity);
+      sprintf(oled_line, "Humi: %d.%d %%RH", humi_int / 10, humi_int % 10);
       OLED_WriteString(0, 32, oled_line);
 
       sprintf(oled_line, "LED: %s", led_state ? "ON" : "OFF");
       OLED_WriteString(0, 48, oled_line);
 
       OLED_Display();
+
+      /* Debug: send data via UART every update */
+      sprintf(rs485_buf, "LED:%s Lux:%d T:%d.%d H:%d.%d\r\n",
+              led_state ? "ON" : "OFF", lux_int,
+              temp_int / 10, temp_int % 10,
+              humi_int / 10, humi_int % 10);
+      HAL_UART_Transmit(&huart3, (uint8_t *)rs485_buf, strlen(rs485_buf), 200);
     }
 
     /* RS485 query response */
     if (rs485_query)
     {
       rs485_query = 0;
-      sprintf(rs485_buf, "LED:%s Lux:%.0f T:%.1f H:%.1f\r\n",
-              led_state ? "ON" : "OFF", light_lux, temperature, humidity);
+      int lux_int2 = (int)light_lux;
+      int temp_int2 = (int)(temperature * 10);
+      int humi_int2 = (int)(humidity * 10);
+      sprintf(rs485_buf, "LED:%s Lux:%d T:%d.%d H:%d.%d\r\n",
+              led_state ? "ON" : "OFF", lux_int2,
+              temp_int2 / 10, temp_int2 % 10,
+              humi_int2 / 10, humi_int2 % 10);
       HAL_UART_Transmit(&huart3, (uint8_t *)rs485_buf, strlen(rs485_buf), 200);
     }
   }
