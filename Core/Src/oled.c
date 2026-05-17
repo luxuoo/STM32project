@@ -1,9 +1,32 @@
 #include "oled.h"
 #include "spi.h"
 #include "main.h"
+#include <string.h>
 
-static uint8_t OLED_Buffer[8][128];
+/* =====================================================================
+ * ST7789 240x240 IPS driver (SPI, 4-wire), legacy OLED_* API kept.
+ *
+ * The STM32F103C8 only has 20 KB of SRAM, so a full 240*240*2 = 115 KB
+ * framebuffer is impossible. Instead the driver keeps a small text
+ * "shadow" buffer of glyph indices and renders the affected scanline
+ * windows on demand inside OLED_Display().
+ *
+ * Glyphs are the original 6x8 ASCII font, scaled 2x to 12x16 so the
+ * text is readable on a 1.3" panel.
+ * Layout: 20 columns x 15 rows of characters at 2x.
+ * ===================================================================== */
 
+#define ST_COLS   (OLED_WIDTH  / 12)   /* 20 */
+#define ST_ROWS   (OLED_HEIGHT / 16)   /* 15 */
+
+static char     s_text[ST_ROWS][ST_COLS];
+static uint16_t s_fg = COLOR_WHITE;
+static uint16_t s_bg = COLOR_BLACK;
+
+/* One glyph row of pixels (12 px wide * 2 bytes) sent as a burst. */
+static uint8_t  s_line_buf[12 * 2];
+
+/* ---------------- 6x8 ASCII font (printable 0x20..0x7E) -------------- */
 static const uint8_t Font6x8[][6] = {
   {0x00,0x00,0x00,0x00,0x00,0x00}, // space
   {0x00,0x00,0x5F,0x00,0x00,0x00}, // !
@@ -102,100 +125,231 @@ static const uint8_t Font6x8[][6] = {
   {0x08,0x08,0x2A,0x1C,0x08,0x00}, // ~
 };
 
-static void OLED_WriteCmd(uint8_t cmd)
+/* ---------------- low-level SPI / DC primitives ---------------- */
+
+static void ST_WriteCmd(uint8_t cmd)
 {
   HAL_GPIO_WritePin(DC_GPIO_Port, DC_Pin, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(RES_GPIO_Port, RES_Pin, GPIO_PIN_SET);
-  HAL_SPI_Transmit(&hspi1, &cmd, 1, 100);
+  HAL_SPI_Transmit(&hspi1, &cmd, 1, HAL_MAX_DELAY);
 }
 
-static void OLED_WriteData(uint8_t *data, uint16_t len)
+static void ST_WriteData8(uint8_t data)
 {
   HAL_GPIO_WritePin(DC_GPIO_Port, DC_Pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(RES_GPIO_Port, RES_Pin, GPIO_PIN_SET);
-  HAL_SPI_Transmit(&hspi1, data, len, 500);
+  HAL_SPI_Transmit(&hspi1, &data, 1, HAL_MAX_DELAY);
 }
 
-void OLED_Init(void)
+static void ST_WriteDataBuf(const uint8_t *buf, uint16_t len)
 {
-  HAL_GPIO_WritePin(RES_GPIO_Port, RES_Pin, GPIO_PIN_RESET);
-  HAL_Delay(10);
-  HAL_GPIO_WritePin(RES_GPIO_Port, RES_Pin, GPIO_PIN_SET);
-
-  OLED_WriteCmd(0xAE); // display off
-  OLED_WriteCmd(0xD5); // clock div
-  OLED_WriteCmd(0x80);
-  OLED_WriteCmd(0xA8); // multiplex
-  OLED_WriteCmd(0x3F); // 1/64
-  OLED_WriteCmd(0xD3); // display offset
-  OLED_WriteCmd(0x00);
-  OLED_WriteCmd(0x40); // start line
-  OLED_WriteCmd(0x8D); // charge pump
-  OLED_WriteCmd(0x14); // enable
-  OLED_WriteCmd(0x20); // memory mode
-  OLED_WriteCmd(0x02); // page addressing
-  OLED_WriteCmd(0xA1); // seg remap
-  OLED_WriteCmd(0xC8); // com scan dir
-  OLED_WriteCmd(0xDA); // com pins
-  OLED_WriteCmd(0x12);
-  OLED_WriteCmd(0x81); // contrast
-  OLED_WriteCmd(0xCF);
-  OLED_WriteCmd(0xD9); // precharge
-  OLED_WriteCmd(0xF1);
-  OLED_WriteCmd(0xDB); // vcomh
-  OLED_WriteCmd(0x30);
-  OLED_WriteCmd(0xA4); // display from RAM
-  OLED_WriteCmd(0xA6); // normal display
-  OLED_WriteCmd(0xAF); // display on
-
-  OLED_Clear();
-  OLED_Display();
+  HAL_GPIO_WritePin(DC_GPIO_Port, DC_Pin, GPIO_PIN_SET);
+  HAL_SPI_Transmit(&hspi1, (uint8_t *)buf, len, HAL_MAX_DELAY);
 }
 
-void OLED_Clear(void)
+/* Set the address window (CASET/RASET) and prepare for RAMWR. */
+static void ST_SetWindow(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 {
-  for (uint8_t page = 0; page < 8; page++)
-    for (uint8_t col = 0; col < 128; col++)
-      OLED_Buffer[page][col] = 0x00;
+  uint8_t a[4];
+
+  ST_WriteCmd(0x2A); /* CASET */
+  a[0] = (uint8_t)(x0 >> 8); a[1] = (uint8_t)(x0 & 0xFF);
+  a[2] = (uint8_t)(x1 >> 8); a[3] = (uint8_t)(x1 & 0xFF);
+  ST_WriteDataBuf(a, 4);
+
+  ST_WriteCmd(0x2B); /* RASET */
+  a[0] = (uint8_t)(y0 >> 8); a[1] = (uint8_t)(y0 & 0xFF);
+  a[2] = (uint8_t)(y1 >> 8); a[3] = (uint8_t)(y1 & 0xFF);
+  ST_WriteDataBuf(a, 4);
+
+  ST_WriteCmd(0x2C); /* RAMWR */
 }
 
-void OLED_SetCursor(uint8_t x, uint8_t y)
+/* ---------------- public helpers ---------------- */
+
+void OLED_BacklightOn(void)
 {
-  OLED_WriteCmd(0xB0 + (y / 8));
-  OLED_WriteCmd(0x00 + (x & 0x0F));
-  OLED_WriteCmd(0x10 + ((x >> 4) & 0x0F));
+  HAL_GPIO_WritePin(BLK_GPIO_Port, BLK_Pin, GPIO_PIN_SET);
 }
 
-void OLED_WriteString(uint8_t x, uint8_t y, const char *str)
+void OLED_BacklightOff(void)
 {
-  while (*str)
-  {
-    char c = *str;
-    if (c < 32 || c > 126) c = ' ';
-    uint8_t idx = c - 32;
-    uint8_t page = y / 8;
-    uint8_t bit_offset = y % 8;
+  HAL_GPIO_WritePin(BLK_GPIO_Port, BLK_Pin, GPIO_PIN_RESET);
+}
 
-    for (uint8_t i = 0; i < 6; i++)
-    {
-      if (x + i < 128 && page < 8)
-      {
-        uint8_t glyph = Font6x8[idx][i];
-        OLED_Buffer[page][x + i] |= (glyph << bit_offset);
-        if (bit_offset > 0 && page + 1 < 8)
-          OLED_Buffer[page + 1][x + i] |= (glyph >> (8 - bit_offset));
-      }
-    }
-    x += 6;
-    str++;
+void OLED_SetColors(uint16_t fg, uint16_t bg)
+{
+  s_fg = fg;
+  s_bg = bg;
+}
+
+/* Fill the entire panel with a solid color. Sends row-by-row to avoid
+ * needing a 115 KB framebuffer. */
+void OLED_FillScreen(uint16_t color)
+{
+  uint8_t row[OLED_WIDTH * 2];
+  uint8_t hi = (uint8_t)(color >> 8);
+  uint8_t lo = (uint8_t)(color & 0xFF);
+  for (int i = 0; i < OLED_WIDTH; i++) {
+    row[i * 2]     = hi;
+    row[i * 2 + 1] = lo;
+  }
+  ST_SetWindow(0, 0, OLED_WIDTH - 1, OLED_HEIGHT - 1);
+  HAL_GPIO_WritePin(DC_GPIO_Port, DC_Pin, GPIO_PIN_SET);
+  for (int y = 0; y < OLED_HEIGHT; y++) {
+    HAL_SPI_Transmit(&hspi1, row, sizeof(row), HAL_MAX_DELAY);
   }
 }
 
+/* ---------------- ST7789 init sequence ---------------- */
+
+void OLED_Init(void)
+{
+  /* Hardware reset (RES low for >=10 us, then high, then wait >=120 ms). */
+  HAL_GPIO_WritePin(RES_GPIO_Port, RES_Pin, GPIO_PIN_SET);
+  HAL_Delay(5);
+  HAL_GPIO_WritePin(RES_GPIO_Port, RES_Pin, GPIO_PIN_RESET);
+  HAL_Delay(20);
+  HAL_GPIO_WritePin(RES_GPIO_Port, RES_Pin, GPIO_PIN_SET);
+  HAL_Delay(150);
+
+  ST_WriteCmd(0x11);          /* SLPOUT - leave sleep */
+  HAL_Delay(120);
+
+  ST_WriteCmd(0x36);          /* MADCTL - memory access control */
+  ST_WriteData8(0x00);        /* row/col order normal, RGB */
+
+  ST_WriteCmd(0x3A);          /* COLMOD - color mode */
+  ST_WriteData8(0x05);        /* 16-bit/pixel (RGB565) */
+
+  ST_WriteCmd(0xB2);          /* PORCTRL */
+  ST_WriteData8(0x0C); ST_WriteData8(0x0C);
+  ST_WriteData8(0x00); ST_WriteData8(0x33); ST_WriteData8(0x33);
+
+  ST_WriteCmd(0xB7);          /* GCTRL */
+  ST_WriteData8(0x35);
+
+  ST_WriteCmd(0xBB);          /* VCOMS */
+  ST_WriteData8(0x19);
+
+  ST_WriteCmd(0xC0);          /* LCMCTRL */
+  ST_WriteData8(0x2C);
+
+  ST_WriteCmd(0xC2);          /* VDVVRHEN */
+  ST_WriteData8(0x01);
+  ST_WriteCmd(0xC3);          /* VRHS */
+  ST_WriteData8(0x12);
+  ST_WriteCmd(0xC4);          /* VDVS */
+  ST_WriteData8(0x20);
+
+  ST_WriteCmd(0xC6);          /* FRCTRL2 - frame rate */
+  ST_WriteData8(0x0F);
+
+  ST_WriteCmd(0xD0);          /* PWCTRL1 */
+  ST_WriteData8(0xA4); ST_WriteData8(0xA1);
+
+  /* Positive gamma */
+  ST_WriteCmd(0xE0);
+  {
+    static const uint8_t pg[14] = {0xD0,0x04,0x0D,0x11,0x13,0x2B,0x3F,
+                                   0x54,0x4C,0x18,0x0D,0x0B,0x1F,0x23};
+    ST_WriteDataBuf(pg, sizeof(pg));
+  }
+  /* Negative gamma */
+  ST_WriteCmd(0xE1);
+  {
+    static const uint8_t ng[14] = {0xD0,0x04,0x0C,0x11,0x13,0x2C,0x3F,
+                                   0x44,0x51,0x2F,0x1F,0x1F,0x20,0x23};
+    ST_WriteDataBuf(ng, sizeof(ng));
+  }
+
+  ST_WriteCmd(0x21);          /* INVON - IPS panels need inversion */
+  ST_WriteCmd(0x29);          /* DISPON */
+  HAL_Delay(20);
+
+  /* Clear once and turn on the backlight. */
+  OLED_FillScreen(s_bg);
+  OLED_Clear();
+  OLED_BacklightOn();
+}
+
+/* ---------------- text-mode shadow buffer ---------------- */
+
+void OLED_Clear(void)
+{
+  memset(s_text, 0, sizeof(s_text));
+}
+
+/* Cursor concept doesn't really apply here; kept as a no-op so the
+ * legacy API still links. */
+void OLED_SetCursor(uint8_t x, uint8_t y)
+{
+  (void)x;
+  (void)y;
+}
+
+/* Store the string into the shadow buffer at (x_pixel, y_pixel).
+ * x advances by 12 px per glyph, lines align to 16 px rows. */
+void OLED_WriteString(uint8_t x, uint8_t y, const char *str)
+{
+  uint8_t row = y / 16;
+  uint8_t col = x / 12;
+
+  if (row >= ST_ROWS) return;
+
+  while (*str && col < ST_COLS) {
+    char c = *str++;
+    if (c < 32 || c > 126) c = ' ';
+    s_text[row][col++] = c;
+  }
+  /* pad the rest of this logical line with spaces so left-over glyphs
+   * from the previous frame are overwritten */
+  while (col < ST_COLS) {
+    s_text[row][col++] = ' ';
+  }
+}
+
+/* ---------------- render a single 12x16 glyph ---------------- */
+
+static void ST_DrawGlyph2x(uint16_t px, uint16_t py, char c)
+{
+  if (c < 32 || c > 126) c = ' ';
+  const uint8_t *g = Font6x8[c - 32];
+
+  ST_SetWindow(px, py, px + 11, py + 15);
+  HAL_GPIO_WritePin(DC_GPIO_Port, DC_Pin, GPIO_PIN_SET);
+
+  uint8_t fg_hi = (uint8_t)(s_fg >> 8);
+  uint8_t fg_lo = (uint8_t)(s_fg & 0xFF);
+  uint8_t bg_hi = (uint8_t)(s_bg >> 8);
+  uint8_t bg_lo = (uint8_t)(s_bg & 0xFF);
+
+  /* For each of the 8 source rows produce 2 output scanlines (2x scale).
+   * Each scanline is 6 source columns -> 12 px doubled. */
+  for (int row = 0; row < 8; row++) {
+    /* build one scanline (12 px = 24 bytes) */
+    for (int col = 0; col < 6; col++) {
+      uint8_t bit = (g[col] >> row) & 0x01;
+      uint8_t hi  = bit ? fg_hi : bg_hi;
+      uint8_t lo  = bit ? fg_lo : bg_lo;
+      s_line_buf[col * 4 + 0] = hi;
+      s_line_buf[col * 4 + 1] = lo;
+      s_line_buf[col * 4 + 2] = hi;
+      s_line_buf[col * 4 + 3] = lo;
+    }
+    /* send the same scanline twice for 2x vertical scale */
+    HAL_SPI_Transmit(&hspi1, s_line_buf, sizeof(s_line_buf), HAL_MAX_DELAY);
+    HAL_SPI_Transmit(&hspi1, s_line_buf, sizeof(s_line_buf), HAL_MAX_DELAY);
+  }
+}
+
+/* Push the shadow buffer to the panel. Each char is drawn at its grid
+ * cell so unchanged text is simply overwritten with the same pixels. */
 void OLED_Display(void)
 {
-  for (uint8_t page = 0; page < 8; page++)
-  {
-    OLED_SetCursor(0, page * 8);
-    OLED_WriteData(OLED_Buffer[page], 128);
+  for (uint8_t r = 0; r < ST_ROWS; r++) {
+    for (uint8_t c = 0; c < ST_COLS; c++) {
+      char ch = s_text[r][c];
+      if (ch == 0) ch = ' ';
+      ST_DrawGlyph2x((uint16_t)c * 12, (uint16_t)r * 16, ch);
+    }
   }
 }
