@@ -1,3 +1,30 @@
-build
+# Build output
+build/
+Debug/
+Release/
+*.o
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+
+# IDE settings
+.settings/
+.vscode/
+.claude/
+*.clangd
+*.mxproject
+
+# STM32CubeMX generated files (can be regenerated)
+Drivers/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.swp
+*.swo
+*~
 mx.scratch
-!.settings
